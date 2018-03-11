@@ -1,4 +1,4 @@
-package gdb
+package godb
 
 // A range
 type Range struct {
