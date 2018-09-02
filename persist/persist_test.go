@@ -1,136 +1,155 @@
 package persist
 
 import (
-  "os"
   "fmt"
   "testing"
   
-  "gdb"
-  "gdb/uuid"
-  "gdb/test"
+  "github.com/hirepurpose/godb/test"
+  "github.com/hirepurpose/godb/uuid"
 )
 
 import (
   "github.com/stretchr/testify/assert"
 )
 
-func TestMain(m *testing.M) {
-  test.Init(m, "gdb_test_persist")
-  os.Exit(m.Run())
-}
-
-var inc = 0
-func newId() interface{} {
-  inc++
-  return fmt.Sprintf("%d", inc)
-}
-
-type entityTester struct {
-  Id    string    `db:"id,pk"`
-  Name  string    `db:"name"`
-}
-
-type entityPersister struct {
-  Persister
-}
-
-func (e entityPersister) Table() string {
-  return "gdb_persist_test" // defined in base but never created in production
-}
-
-func (t entityPersister) GenerateId(val interface{}, cxt gdb.Context) (interface{}, error) {
-  return uuid.New().String(), nil
-}
-
-func (t entityPersister) IsTransient(val interface{}, cxt gdb.Context) (bool, error) {
-  var n int
-  id := val.(*entityTester).Id
-  if id == "" {
-    return true, nil
-  }
-  if cxt == nil {
-    cxt = t.DefaultContext()
-  }
-  err := cxt.QueryRow(`SELECT COUNT(*) FROM gdb_persist_test WHERE id = $1`, id).Scan(&n)
-  if err != nil {
-    return false, err
-  }
-  return n == 0, nil
-}
-
-func (e entityPersister) StoreTesterEntity(v *entityTester, opts StoreOptions, cxt gdb.Context) error {
-  return e.StoreEntity(e, v, opts, cxt)
-}
-
-func (e entityPersister) FetchTesterEntity(id string, opts FetchOptions, cxt gdb.Context) (*entityTester, error) {
-  v := &entityTester{}
-  err := e.FetchEntity(e, v, opts, cxt, `SELECT {*} FROM gdb_persist_test WHERE id = $1`, id)
-  if err != nil {
-    return nil, err
-  }
-  return v, nil
-}
-
-func (e entityPersister) FetchTesterEntities(limit gdb.Range, opts FetchOptions, cxt gdb.Context) ([]*entityTester, error) {
-  var v []*entityTester
-  err := e.FetchEntities(e, &v, opts, cxt, `SELECT {*} FROM gdb_persist_test ORDER BY created_at, id OFFSET $1 LIMIT $2`, limit.Location, limit.Length)
-  if err != nil {
-    return nil, err
-  }
-  return v, nil
-}
-
-func (e entityPersister) DeleteTesterEntity(v *entityTester, opts StoreOptions, cxt gdb.Context) error {
-  return e.DeleteEntity(e, v, opts, cxt)
-}
-
-func TestIdentHandling(t *testing.T) {
-  var err error
-  
+func TestCRUD(t *testing.T) {
   cxt := test.DB()
   if !assert.NotNil(t, cxt) { return }
-  p := &entityPersister{New(cxt)}
+  pe := &entityPersister{New(cxt)}
+  pf := &foreignPersister{New(cxt)}
   
-  _, err = cxt.Exec("DROP TABLE IF EXISTS gdb_persist_test;")
-  if !assert.Nil(t, err) { return }
-  _, err = cxt.Exec("CREATE TABLE gdb_persist_test (id uuid primary key, name varchar(128) not null, created_at timestamp with time zone not null default now());")
-  if !assert.Nil(t, err) { return }
+  f := &foreignTester{Value:"Foreign value"}
+  err := pf.StoreTesterEntity(f, 0, nil)
+  assert.Nil(t, err, fmt.Sprintf("%v", err))
   
-  e := &entityTester{"", "This is the name"}
-  trans, err := p.IsTransient(e, cxt)
+  e := &entityTester{Id: "", Name: "This is the name", Foreign: f, Named: &namedInlineTester{true, "Named inline struct B"}}
+  e.Inline.A = "Anonymous inline struct A"
+  e.Inline.B = 998877
+  
+  trans, err := pe.IsTransient(e, cxt)
   if assert.Nil(t, err, fmt.Sprintf("%v", err)) {
     assert.Equal(t, true, trans)
   }
   
   e.Id = uuid.New().String()
-  trans, err = p.IsTransient(e, cxt)
+  trans, err = pe.IsTransient(e, cxt)
   if assert.Nil(t, err, fmt.Sprintf("%v", err)) {
     assert.Equal(t, true, trans)
   }
   
-  err = p.StoreTesterEntity(e, 0, nil)
+  err = pe.StoreTesterEntity(e, StoreOptionCascade, nil)
   assert.Nil(t, err, fmt.Sprintf("%v", err))
   
-  c, err := p.FetchTesterEntity(e.Id, 0, nil)
+  c, err := pe.FetchTesterEntity(e.Id, FetchOptionCascade, nil)
   if assert.Nil(t, err, fmt.Sprintf("%v", err)) {
     assert.Equal(t, e, c)
   }
   
-  trans, err = p.IsTransient(e, cxt)
+  trans, err = pe.IsTransient(e, cxt)
   if assert.Nil(t, err, fmt.Sprintf("%v", err)) {
     assert.Equal(t, false, trans)
   }
   
-  a, err := p.FetchTesterEntities(gdb.Range{0, 100}, 0, nil)
+  a, err := pe.FetchTesterEntities(Range{0, 100}, FetchOptionCascade, nil)
   if assert.Nil(t, err, fmt.Sprintf("%v", err)) {
     assert.Equal(t, []*entityTester{e}, a)
   }
   
-  err = p.DeleteTesterEntity(e, 0, nil)
+  err = pe.DeleteTesterEntity(e, 0, nil)
   assert.Nil(t, err, fmt.Sprintf("%v", err))
   
-  trans, err = p.IsTransient(e, cxt)
+  trans, err = pe.IsTransient(e, cxt)
   if assert.Nil(t, err, fmt.Sprintf("%v", err)) {
     assert.Equal(t, true, trans)
   }
+}
+
+func TestFetchOne(t *testing.T) {
+  cxt := test.DB()
+  pe := &entityPersister{New(cxt)}
+  n := 100
+  
+  _, err := cxt.Exec(fmt.Sprintf("DELETE FROM %s", table))
+  if !assert.Nil(t, err, fmt.Sprintf("%v", err)) {
+    return
+  }
+  
+  for i := 0; i < n; i++ {
+    e := &entityTester{Name: fmt.Sprintf("%04d This is the name", i), Named: &namedInlineTester{true, fmt.Sprintf("Named inline struct B #%d", i)}}
+    e.Inline.A = fmt.Sprintf("Anonymous inline struct A #%d", i)
+    e.Inline.B = i
+    
+    err := pe.StoreTesterEntity(e, StoreOptionCascade, nil)
+    assert.Nil(t, err, fmt.Sprintf("%v", err))
+    
+    r, err := pe.FetchTesterEntity(e.Id, FetchOptionCascade, nil)
+    if assert.Nil(t, err, fmt.Sprintf("%v", err)) {
+      assert.Equal(t, e, r)
+    }
+  }
+  
+}
+
+func TestFetchMany(t *testing.T) {
+  cxt := test.DB()
+  pe := &entityPersister{New(cxt)}
+  n := 100
+  
+  _, err := cxt.Exec(fmt.Sprintf("DELETE FROM %s", table))
+  if !assert.Nil(t, err, fmt.Sprintf("%v", err)) {
+    return
+  }
+  
+  check := make([]*entityTester, n)
+  for i := 0; i < n; i++ {
+    e := &entityTester{Name: fmt.Sprintf("%04d This is the name", i), Named: &namedInlineTester{true, fmt.Sprintf("Named inline struct B #%d", i)}}
+    e.Inline.A = fmt.Sprintf("Anonymous inline struct A #%d", i)
+    e.Inline.B = i
+    
+    err := pe.StoreTesterEntity(e, StoreOptionCascade, nil)
+    assert.Nil(t, err, fmt.Sprintf("%v", err))
+    check[i] = e
+  }
+  
+  a, err := pe.FetchTesterEntities(Range{0, n}, FetchOptionCascade, nil)
+  if assert.Nil(t, err, fmt.Sprintf("%v", err)) {
+    assert.Equal(t, check, a)
+  }
+  
+}
+
+func TestFetchIter(t *testing.T) {
+  cxt := test.DB()
+  pe := &entityPersister{New(cxt)}
+  n := 1000
+  
+  _, err := cxt.Exec(fmt.Sprintf("DELETE FROM %s", table))
+  if !assert.Nil(t, err, fmt.Sprintf("%v", err)) {
+    return
+  }
+  
+  check := make([]*entityTester, n)
+  for i := 0; i < n; i++ {
+    e := &entityTester{Name: fmt.Sprintf("%04d This is the name", i), Named: &namedInlineTester{true, fmt.Sprintf("Named inline struct B #%d", i)}}
+    e.Inline.A = fmt.Sprintf("Anonymous inline struct A #%d", i)
+    e.Inline.B = i
+    
+    err := pe.StoreTesterEntity(e, StoreOptionCascade, nil)
+    assert.Nil(t, err, fmt.Sprintf("%v", err))
+    check[i] = e
+  }
+  
+  it, err := pe.IterTesterEntities(FetchOptionCascade, nil)
+  if assert.Nil(t, err, fmt.Sprintf("%v", err)) {
+    i := 0
+    for ; it.Next(); i++ {
+      x := &entityTester{}
+      err = it.Scan(x)
+      if assert.Nil(t, err, fmt.Sprintf("%v", err)) {
+        assert.Equal(t, check[i], x)
+      }
+    }
+    assert.Equal(t, n, i)
+  }
+  
 }

@@ -4,7 +4,7 @@ import (
   "fmt"
   "encoding/json"
   
-  "gdb/uuid"
+  "github.com/hirepurpose/godb/uuid"
 )
 
 // Generate a property list, optionally with a qualifier

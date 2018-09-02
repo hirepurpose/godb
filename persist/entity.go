@@ -50,10 +50,10 @@ func (e *mappingEntity) NewPersistentId(v interface{}) interface{} {
   return x
 }
 
-func (e *mappingEntity) PersistentValues(v interface{}) (map[string]interface{}, error) {
+func (e *mappingEntity) PersistentValues(v interface{}) (Columns, error) {
   return (*mapping)(e).Values(reflect.ValueOf(v), false, Write)
 }
 
-func (e *mappingEntity) ValueDestinations(v interface{}, cols []string) ([]interface{}, error) {
+func (e *mappingEntity) ValueDestinations(v interface{}, cols []string) ([]interface{}, Columns, error) {
   return (*mapping)(e).Dests(reflect.ValueOf(v), cols)
 }

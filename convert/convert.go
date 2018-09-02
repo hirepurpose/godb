@@ -13,7 +13,7 @@ import (
   "database/sql"
   "database/sql/driver"
   
-  "gdb/uuid"
+  "github.com/hirepurpose/godb/uuid"
 )
 
 var errNilPtr = errors.New("Destination pointer is nil") // embedded in descriptive error

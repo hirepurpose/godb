@@ -5,10 +5,16 @@ import (
   "time"
   "reflect"
   
-  "gdb/uuid"
+  "github.com/hirepurpose/godb/uuid"
 )
 
-// Is this interface empty
+// A range
+type Range struct {
+  Location  int
+  Length    int
+}
+
+// Is this interface "empty"
 func IsEmpty(v interface{}) bool {
   switch c := v.(type) {
     case nil:
@@ -30,13 +36,22 @@ func IsEmpty(v interface{}) bool {
     case reflect.Array, reflect.Chan, reflect.Map, reflect.Slice, reflect.String:
       return val.Len() == 0
     case reflect.Ptr, reflect.Func, reflect.Interface:
-      return !val.IsValid() || val.IsNil()
+      return val.IsNil()
   }
   
   return false
 }
 
-// Generate an argument list
+// Obtain a displayable type
+func typeName(v reflect.Value) string {
+  if v.IsValid() {
+    return v.Type().String()
+  }else{
+    return "<invalid>"
+  }
+}
+
+// Generate an SQL argument list
 func arglist(s, n int) string {
   var l string
   for i := 0; i < n; i++ {

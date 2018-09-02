@@ -1,7 +1,7 @@
 package faux
 
 import (
-  "gdb/sync"
+  "github.com/hirepurpose/godb/sync"
 )
 
 // A faux mutex which does no actual locking

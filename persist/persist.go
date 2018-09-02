@@ -3,12 +3,10 @@ package persist
 import (
   "fmt"
   "time"
-  "sync"
   "reflect"
-  "database/sql"
   
-  "gdb"
-  "gdb/pql"
+  "github.com/hirepurpose/godb"
+  "github.com/hirepurpose/godb/pql"
 )
 
 import (
@@ -26,22 +24,25 @@ var (
   deleteDurationMetric metrics.Timer
   fetchOneDurationMetric metrics.Timer
   fetchManyDurationMetric metrics.Timer
+  iterDurationMetric metrics.Timer
 )
 
 // Setup metrics
 func init() {
   storeDurationMetric = metrics.NewTimer()
-  metrics.Register("gdb.persist.store", storeDurationMetric)
+  metrics.Register("godb.persist.store", storeDurationMetric)
   insertDurationMetric = metrics.NewTimer()
-  metrics.Register("gdb.persist.store.insert", insertDurationMetric)
+  metrics.Register("godb.persist.store.insert", insertDurationMetric)
   updateDurationMetric = metrics.NewTimer()
-  metrics.Register("gdb.persist.store.update", updateDurationMetric)
+  metrics.Register("godb.persist.store.update", updateDurationMetric)
   deleteDurationMetric = metrics.NewTimer()
-  metrics.Register("gdb.persist.delete", deleteDurationMetric)
+  metrics.Register("godb.persist.delete", deleteDurationMetric)
   fetchOneDurationMetric = metrics.NewTimer()
-  metrics.Register("gdb.persist.fetch.one", fetchOneDurationMetric)
+  metrics.Register("godb.persist.fetch.one", fetchOneDurationMetric)
   fetchManyDurationMetric = metrics.NewTimer()
-  metrics.Register("gdb.persist.fetch.many", fetchManyDurationMetric)
+  metrics.Register("godb.persist.fetch.many", fetchManyDurationMetric)
+  iterDurationMetric = metrics.NewTimer()
+  metrics.Register("godb.persist.iter", iterDurationMetric)
 }
 
 // Store options
@@ -53,6 +54,8 @@ const (
   StoreOptionDeleteReferences = StoreOptions(1 << 2)
   StoreOptionDeleteOrphans    = StoreOptions(1 << 3) | StoreOptionDeleteReferences
   StoreOptionCascade          = StoreOptionStoreReferences | StoreOptionStoreRelated | StoreOptionDeleteReferences | StoreOptionDeleteOrphans
+  StoreOptionReserved         = StoreOptions(0xffff)  // bits reserved to the `hp/db/persist` package
+  StoreUserOption             = 17                    // base for user options
 )
 
 // Fetch options
@@ -61,25 +64,34 @@ const (
   FetchOptionNone             = FetchOptions(0)
   FetchOptionFetchRelated     = FetchOptions(1 << 0)
   FetchOptionCascade          = FetchOptionFetchRelated
-  FetchOptionConcurrent       = FetchOptions(1 << 1) // sub-fetches may be performed concurrently
+  FetchOptionConcurrent       = FetchOptions(1 << 1)  // sub-fetches may be performed concurrently
+  FetchOptionReserved         = FetchOptions(0xffff)  // bits reserved to the `hp/db/persist` package
+  FetchUserOption             = 17                    // base for user options
 )
-
-// Persistent values
-type Values map[string]interface{}
 
 // Ident type
 var typeOfIdent = reflect.TypeOf((*Ident)(nil)).Elem()
 
 // Identifier type
 type Ident interface {
+  // Produce a new, unique identifier
   New()(interface{})
 }
 
-// Persistent type
-var typeOfPersistent = reflect.TypeOf((*Persistent)(nil)).Elem()
+// Foreign entity type
+var typeOfForeignEntity = reflect.TypeOf((*ForeignEntity)(nil)).Elem()
 
-// Implemented by persistent/persistable types
-type Persistent interface {
+// Implemented by foreign entities
+type ForeignEntity interface {
+  // Obtain the foreign key that identifies this entity
+  ForeignKey()(interface{})
+}
+
+// Persistent type
+var typeOfPersister = reflect.TypeOf((*Persister)(nil)).Elem()
+
+// Implemented by persisters
+type Persister interface {
   // Obtain the persistent table name.
   Table()(string)
 }
@@ -87,7 +99,7 @@ type Persistent interface {
 // Mapping type
 var typeOfPersistentMapping = reflect.TypeOf((*PersistentMapping)(nil)).Elem()
 
-// Implemented by persistent/persistable types that define explicit mappings
+// Implemented by entities that define explicit mappings
 type PersistentMapping interface {
   // Obtain the entity's primary key column names.
   PrimaryKeys()([]string)
@@ -100,79 +112,102 @@ type PersistentMapping interface {
   // Generate a new persistent identifier.
   NewPersistentId(interface{})(interface{})
   // Obtain a relational column-to-value mapping of this entity's values, EXCLUDING the primary key, which is the persistent id.
-  PersistentValues(interface{})(map[string]interface{}, error)
+  PersistentValues(interface{})(Columns, error)
   // Obtain scanning destinaions for the provided ordered relational columns INCLUDING the primary key. This weird interface is an artifact of sql.Rows.Scan().
-  ValueDestinations(interface{}, []string)([]interface{}, error)
+  ValueDestinations(interface{}, []string)([]interface{}, Columns, error)
 }
 
-// Implemented by persistent types that explicitly generate identifiers
+// Implemented by persisters that explicitly generate identifiers
 type GeneratesIdentifiers interface {
+  // Determine if this entity is transient or not. Within the scope of a single store operation, this method
+  // will only be called by the ORM before calling GenerateId (if necessary) and setting the generated identifier.
+  IsTransient(interface{}, godb.Context)(bool, error)
   // Generate and set identifiers as necessary for the provided entity
-  GenerateId(interface{}, gdb.Context)(interface{}, error)
-  // Determine if this entity is transient or not
-  IsTransient(interface{}, gdb.Context)(bool, error)
+  GenerateId(interface{}, godb.Context)(interface{}, error)
 }
 
-// Implemented by persistent types with relationships
-type StoresRelationships interface {
+// Implemented by persisters with relationships
+type StoresRelated interface {
   // Persist dependent entities
-  StoreRelated(interface{}, StoreOptions, gdb.Context)(error)
+  StoreRelated(interface{}, StoreOptions, godb.Context)(error)
+}
+type StoresReferences interface {
   // Persist relationships for dependent entities, but not the entities
-  StoreReferences(interface{}, StoreOptions, gdb.Context)(error)
+  StoreReferences(interface{}, StoreOptions, godb.Context)(error)
 }
 
-// Implemented by persistent types with relationships
-type FetchesRelationships interface {
+// Implemented by persisters with relationships
+type FetchesRelated interface {
   // Fetch dependent entities
-  FetchRelated(interface{}, FetchOptions, gdb.Context)(error)
+  FetchRelated(interface{}, FetchOptions, godb.Context)(error)
 }
 
-// Implemented by persistent types with relationships
-type DeletesRelationships interface {
-  // Delete dependent entity relationships, but not the entities
-  DeleteReferences(interface{}, StoreOptions, gdb.Context)(error)
+// Implemented by persisters with relationships that support extra properties (e.g., for foreign keys)
+type FetchesRelatedExtra interface {
+  // Fetch dependent entities
+  FetchRelatedExtra(interface{}, Columns, FetchOptions, godb.Context)(error)
+}
+
+// Implemented by persisters with relationships
+type DeletesRelated interface {
   // Delete dependent entities
-  DeleteRelated(interface{}, StoreOptions, gdb.Context)(error)
+  DeleteRelated(interface{}, StoreOptions, godb.Context)(error)
+}
+type DeletesReferences interface {
+  // Delete dependent entity relationships, but not the entities
+  DeleteReferences(interface{}, StoreOptions, godb.Context)(error)
 }
 
-// Persister
-type Persister interface {
-  DefaultContext()(gdb.Context)
+// An ORM
+type ORM interface {
+  Context(godb.Context)(godb.Context)
+  DefaultContext()(godb.Context)
   
-  StoreEntity(Persistent, interface{}, StoreOptions, gdb.Context)(error)
-  CountEntities(Persistent, string, ...interface{})(int, error)
-  FetchEntity(Persistent, interface{}, FetchOptions, gdb.Context, string, ...interface{})(error)
-  FetchEntities(Persistent, interface{}, FetchOptions, gdb.Context, string, ...interface{})(error)
-  DeleteEntity(Persistent, interface{}, StoreOptions, gdb.Context)(error)
-
-  StoreRelated(Persistent, interface{}, StoreOptions, gdb.Context)(error)
-  FetchRelated(Persistent, interface{}, FetchOptions, gdb.Context)(error)
-  StoreReferences(Persistent, interface{}, StoreOptions, gdb.Context)(error)
-  DeleteRelationships(Persistent, interface{}, StoreOptions, gdb.Context)(error)
+  StoreEntity(Persister, interface{}, StoreOptions, godb.Context)(error)
+  CountEntities(Persister, godb.Context, string, ...interface{})(int, error)
+  FetchEntity(Persister, interface{}, FetchOptions, godb.Context, string, ...interface{})(error)
+  FetchEntities(Persister, interface{}, FetchOptions, godb.Context, string, ...interface{})(error)
+  IterEntities(Persister, reflect.Type, FetchOptions, godb.Context, string, ...interface{})(*iter, error)
+  DeleteEntity(Persister, interface{}, StoreOptions, godb.Context)(error)
+  
+  StoreRelated(Persister, interface{}, StoreOptions, godb.Context)(error)
+  FetchRelated(Persister, interface{}, Columns, FetchOptions, godb.Context)(error)
+  StoreReferences(Persister, interface{}, StoreOptions, godb.Context)(error)
+  DeleteRelated(Persister, interface{}, StoreOptions, godb.Context)(error)
+  DeleteReferences(Persister, interface{}, StoreOptions, godb.Context)(error)
 }
 
 // Concrete persister
-type persister struct {
-  cxt gdb.Context
+type orm struct {
+  cxt godb.Context
 }
 
 // Create a persister
-func New(cxt gdb.Context) Persister {
+func New(cxt godb.Context) ORM {
   if debug.VERBOSE {
-    cxt = gdb.NewDebugContext(cxt)
+    cxt = godb.NewDebugContext(cxt)
   }
-  return &persister{cxt}
+  return &orm{cxt}
 }
 
 // Obtain the default execution context
-func (d *persister) DefaultContext() gdb.Context {
+func (d *orm) DefaultContext() godb.Context {
   return d.cxt
 }
 
+// Resolve the execution context
+func (d *orm) Context(c godb.Context) godb.Context {
+  if c != nil {
+    return c
+  }else{
+    return d.DefaultContext()
+  }
+}
+
 // Store related
-func (d *persister) StoreRelated(p Persistent, v interface{}, opts StoreOptions, cxt gdb.Context) error {
-  if rel, ok := p.(StoresRelationships); ok {
-    if (opts & StoreOptionStoreRelated) == StoreOptionStoreRelated {
+func (d *orm) StoreRelated(p Persister, v interface{}, opts StoreOptions, cxt godb.Context) error {
+  if (opts & StoreOptionStoreRelated) == StoreOptionStoreRelated {
+    if rel, ok := p.(StoresRelated); ok {
       err := rel.StoreRelated(v, opts, cxt)
       if err != nil {
         return err
@@ -183,9 +218,9 @@ func (d *persister) StoreRelated(p Persistent, v interface{}, opts StoreOptions,
 }
 
 // Store relationships
-func (d *persister) StoreReferences(p Persistent, v interface{}, opts StoreOptions, cxt gdb.Context) error {
-  if rel, ok := p.(StoresRelationships); ok {
-    if (opts & StoreOptionStoreRelated) == StoreOptionStoreRelated {
+func (d *orm) StoreReferences(p Persister, v interface{}, opts StoreOptions, cxt godb.Context) error {
+  if (opts & StoreOptionStoreReferences) == StoreOptionStoreReferences {
+    if rel, ok := p.(StoresReferences); ok {
       err := rel.StoreReferences(v, opts, cxt)
       if err != nil {
         return err
@@ -196,9 +231,14 @@ func (d *persister) StoreReferences(p Persistent, v interface{}, opts StoreOptio
 }
 
 // Fetch relationships
-func (d *persister) FetchRelated(p Persistent, v interface{}, opts FetchOptions, cxt gdb.Context) error {
-  if rel, ok := p.(FetchesRelationships); ok {
-    if (opts & FetchOptionFetchRelated) == FetchOptionFetchRelated {
+func (d *orm) FetchRelated(p Persister, v interface{}, extra Columns, opts FetchOptions, cxt godb.Context) error {
+  if (opts & FetchOptionFetchRelated) == FetchOptionFetchRelated {
+    if rel, ok := p.(FetchesRelatedExtra); ok {
+      err := rel.FetchRelatedExtra(v, extra, opts, cxt)
+      if err != nil {
+        return err
+      }
+    }else if rel, ok := p.(FetchesRelated); ok {
       err := rel.FetchRelated(v, opts, cxt)
       if err != nil {
         return err
@@ -209,15 +249,22 @@ func (d *persister) FetchRelated(p Persistent, v interface{}, opts FetchOptions,
 }
 
 // Delete relationships
-func (d *persister) DeleteRelationships(p Persistent, v interface{}, opts StoreOptions, cxt gdb.Context) error {
-  if rel, ok := p.(DeletesRelationships); ok {
-    if (opts & StoreOptionDeleteReferences) == StoreOptionDeleteReferences {
+func (d *orm) DeleteReferences(p Persister, v interface{}, opts StoreOptions, cxt godb.Context) error {
+  if (opts & StoreOptionDeleteReferences) == StoreOptionDeleteReferences {
+    if rel, ok := p.(DeletesReferences); ok {
       err := rel.DeleteReferences(v, opts, cxt)
       if err != nil {
         return err
       }
     }
-    if (opts & StoreOptionDeleteOrphans) == StoreOptionDeleteOrphans {
+  }
+  return nil
+}
+
+// Delete relationships
+func (d *orm) DeleteRelated(p Persister, v interface{}, opts StoreOptions, cxt godb.Context) error {
+  if (opts & StoreOptionDeleteOrphans) == StoreOptionDeleteOrphans {
+    if rel, ok := p.(DeletesRelated); ok {
       err := rel.DeleteRelated(v, opts, cxt)
       if err != nil {
         return err
@@ -228,30 +275,35 @@ func (d *persister) DeleteRelationships(p Persistent, v interface{}, opts StoreO
 }
 
 // Store a single persistent entity. The entity is either updated or inserted as needed.
-func (d *persister) StoreEntity(p Persistent, v interface{}, opts StoreOptions, cxt gdb.Context) error {
+func (d *orm) StoreEntity(p Persister, v interface{}, opts StoreOptions, cxt godb.Context) error {
   start := time.Now()
   defer func() { storeDurationMetric.Update(time.Since(start)) }()
-  if cxt == nil {
-    cxt = d.DefaultContext()
+  cxt = d.Context(cxt)
+  
+  var tr *trace.Trace
+  var sp *trace.Span
+  if debug.TRACE {
+    tr = trace.New(fmt.Sprintf("trace: db/store/1: (%T) %v", v, v)).Warn(time.Millisecond)
+    defer tr.Finish()
   }
   
+  sp = tr.Start(fmt.Sprintf("%T: Get or create mapping", v))
   var m PersistentMapping
   if x, ok := p.(PersistentMapping); ok {
     m = x
   }else{
     m = newMappingEntity(v)
   }
+  sp.Finish()
   
-  rel, relok := p.(StoresRelationships)
-  if relok {
-    if (opts & StoreOptionStoreRelated) == StoreOptionStoreRelated {
-      err := rel.StoreRelated(v, opts, cxt)
-      if err != nil {
-        return err
-      }
-    }
+  sp = tr.Start(fmt.Sprintf("%T: Store related entities", v))
+  err := d.StoreRelated(p, v, opts, cxt)
+  if err != nil {
+    return err
   }
+  sp.Finish()
   
+  sp = tr.Start(fmt.Sprintf("%T: Resolve identifiers: %v", v, v))
   var trans bool
   pkid := m.PersistentId(v)
   gen, genok := p.(GeneratesIdentifiers)
@@ -259,15 +311,24 @@ func (d *persister) StoreEntity(p Persistent, v interface{}, opts StoreOptions, 
     trans = IsEmpty(pkid)
   }else{
     var err error
-    trans, err = gen.IsTransient(v, cxt)
+    trans, err = gen.IsTransient(v, cxt) // IsTransient must never be called AFTER GenerateId is called, below
     if err != nil {
       return err
     }
   }
+  sp.Finish()
   
+  sp = tr.Start(fmt.Sprintf("%T: Map persistent values", v))
   pvals, err := m.PersistentValues(v)
   if err != nil {
     return err
+  }
+  sp.Finish()
+  
+  sp = tr.Start(fmt.Sprintf("%T: Build query", v))
+  pks := m.PrimaryKeys()
+  if l := len(pks); l != 1 {
+    return fmt.Errorf("Primary key count is invalid: %d != %d", l, 1)
   }
   
   var kc int
@@ -284,44 +345,56 @@ func (d *persister) StoreEntity(p Persistent, v interface{}, opts StoreOptions, 
         return err
       }
     }
-    if kc > 0 { kl += ", " }; kl += "id"
+    if kc > 0 { kl += ", " }; kl += pks[0]
     vals = append(vals, pkid)
+    if debug.TRACE {
+      names, vals := pvals.KeysVals()
+      dumpMapping(v, names, vals)
+    }
     q = fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", p.Table(), kl, arglist(1, len(vals)))
   }else{
     defer func() { updateDurationMetric.Update(time.Since(start)) }()
     kl, kc, vals = keyValueList("", pvals)
     vals = append(vals, pkid)
-    q = fmt.Sprintf("UPDATE %s SET %s WHERE id = $%d", p.Table(), kl, kc + 1)
+    if debug.TRACE {
+      names, vals := pvals.KeysVals()
+      dumpMapping(v, names, vals)
+    }
+    q = fmt.Sprintf("UPDATE %s SET %s WHERE %s = $%d", p.Table(), kl, pks[0], kc + 1)
   }
+  sp.Finish()
   
+  sp = tr.Start(fmt.Sprintf("%T: Execute query (%s)", v, q))
   _, err = cxt.Exec(q, vals...)
   if err != nil {
     return err
   }
+  sp.Finish()
   
   if trans { // this has to happen before we persist relationships
+    sp = tr.Start(fmt.Sprintf("%T: Set persistent ident", v))
     err := m.SetPersistentId(v, pkid)
     if err != nil {
       return err
     }
+    sp.Finish()
   }
   
-  if relok {
-    if (opts & StoreOptionStoreReferences) == StoreOptionStoreReferences {
-      err := rel.StoreReferences(v, opts, cxt)
-      if err != nil {
-        return err
-      }
-    }
+  sp = tr.Start(fmt.Sprintf("%T: Store references", v))
+  err = d.StoreReferences(p, v, opts, cxt)
+  if err != nil {
+    return err
   }
+  sp.Finish()
   
   return nil
 }
 
 // Count persistent entities.
-func (d *persister) CountEntities(p Persistent, q string, v ...interface{}) (int, error) {
+func (d *orm) CountEntities(p Persister, cxt godb.Context, q string, v ...interface{}) (int, error) {
+  cxt = d.Context(cxt)
   var n int
-  err := d.DefaultContext().QueryRow(q, v...).Scan(&n)
+  err := cxt.QueryRow(q, v...).Scan(&n)
   if err != nil {
     return -1, err
   }
@@ -329,60 +402,81 @@ func (d *persister) CountEntities(p Persistent, q string, v ...interface{}) (int
 }
 
 // Fetch a single persistent entity.
-func (d *persister) FetchEntity(p Persistent, v interface{}, opts FetchOptions, cxt gdb.Context, src string, args ...interface{}) error {
-  start := time.Now()
-  defer func() { fetchOneDurationMetric.Update(time.Since(start)) }()
-  if cxt == nil {
-    cxt = d.DefaultContext()
+func (d *orm) FetchEntity(p Persister, v interface{}, opts FetchOptions, cxt godb.Context, src string, args ...interface{}) error {
+  var tr *trace.Trace
+  var sp *trace.Span
+  if debug.TRACE {
+    tr = trace.New("trace: db/fetch/1: "+ text.CollapseSpaces(src)).Warn(time.Millisecond)
+    defer tr.Finish()
   }
   
+  start := time.Now()
+  defer func() { fetchOneDurationMetric.Update(time.Since(start)) }()
+  cxt = d.Context(cxt)
+  
+  sp = tr.Start("Get or create mapping")
   var m PersistentMapping
-  if x, ok := p.(PersistentMapping); ok {
-    m = x
+  if c, ok := p.(PersistentMapping); ok {
+    m = c
   }else{
     m = newMappingEntity(v)
   }
+  sp.Finish()
   
+  sp = tr.Start("Parse PQL query")
   q, err := pql.Parse(src, append(m.PrimaryKeys(), m.Columns()...))
   if err != nil {
     return err
   }
+  sp.Finish()
   
-  dest, err := m.ValueDestinations(v, q.Columns)
+  sp = tr.Start("Execute query")
+  rows, err := cxt.Query(q.SQL, args...)
+  if err != nil {
+    if debug.VERBOSE {
+      return fmt.Errorf("persist: Could not query row for %T (%s): %v", v, q.SQL, err)
+    }else{
+      return fmt.Errorf("persist: Could not query row for %T: %v", v, err)
+    }
+  }
+  sp.Finish()
+  
+  it := newIter(rows, d, opts, cxt, m, p, q, tr)
+  defer func() {
+    if it != nil {
+      it.Close()
+    }
+  }()
+  
+  if !it.Next() {
+    return godb.ErrNotFound
+  }
+  
+  err = it.Scan(v)
   if err != nil {
     return err
   }
   
-  err = cxt.QueryRow(q.SQL, args...).Scan(dest...)
-  if err == sql.ErrNoRows {
-    return gdb.ErrNotFound
-  }else if err != nil {
+  err = it.Close(); it = nil
+  if err != nil {
     return err
-  }
-  
-  if rel, ok := p.(FetchesRelationships); ok {
-    if (opts & FetchOptionFetchRelated) == FetchOptionFetchRelated {
-      err = rel.FetchRelated(v, opts, cxt)
-      if err != nil {
-        return err
-      }
-    }
   }
   
   return nil
 }
 
 // Fetch many persistent entities.
-func (d *persister) FetchEntities(p Persistent, r interface{}, opts FetchOptions, cxt gdb.Context, src string, args ...interface{}) error {
-  tr := trace.New("trace: db/fetch/n: "+ text.CollapseSpaces(src)).Warn(time.Millisecond)
-  defer tr.Finish()
+func (d *orm) FetchEntities(p Persister, r interface{}, opts FetchOptions, cxt godb.Context, src string, args ...interface{}) error {
+  var tr *trace.Trace
   var sp *trace.Span
+  if debug.TRACE {
+    tr = trace.New("trace: db/fetch/n: "+ text.CollapseSpaces(src)).Warn(time.Millisecond)
+    defer tr.Finish()
+  }
   
   start := time.Now()
   defer func() { fetchManyDurationMetric.Update(time.Since(start)) }()
-  if cxt == nil {
-    cxt = d.DefaultContext()
-  }
+  cxt = d.Context(cxt)
   
   sp = tr.Start("Lookup entity type")
   var isptr bool
@@ -430,82 +524,31 @@ func (d *persister) FetchEntities(p Persistent, r interface{}, opts FetchOptions
   }
   sp.Finish()
   
-  ccount := -1
-  cnames, err := rows.Columns()
-  if err != nil {
-    return err
-  }
-  
-  var waiter sync.WaitGroup
-  sem := make(chan struct{}, 10)
-  var i int
+  it := newIter(rows, d, opts, cxt, m, p, q, tr)
+  defer func() {
+    if it != nil {
+      it.Close()
+    }
+  }()
   
   spres := tr.Start("Process results")
-  var discard []interface{} // discard columns, if we have extraneous fields
-  defer rows.Close()
-  for rows.Next() {
+  for it.Next() {
     v := reflect.New(btype)
     e := v.Interface()
     
-    sp = spres.Start("Map destinations")
-    dest, err := m.ValueDestinations(e, q.Columns)
+    err = it.Scan(e)
     if err != nil {
       return err
     }
-    sp.Finish()
-    
-    if ccount < 0 {
-      ccount = len(dest)
-      if n := len(cnames) - ccount; n > 0 {
-        for i := 0; i < n; i++ {
-          var v interface{}
-          discard = append(discard, &v)
-        }
-      }
-    }
-    if discard != nil {
-      dest = append(dest, discard...)
-    }
-    
-    sp = spres.Start("Scan destinations")
-    err = rows.Scan(dest...)
-    if err != nil {
-      return err
-    }
-    sp.Finish()
     
     sval = reflect.Append(sval, v) // expand, placeholder
-    sem <- struct{}{}
-    if err != nil {
-      break // error in a previous iteration, bail out
-    }
-    
-    waiter.Add(1)
-    go func(i int, v reflect.Value, e interface{}){
-      defer func(){ <-sem; waiter.Done() }()
-      sp = spres.Start("Sub-fetch relationships")
-      if rel, ok := p.(FetchesRelationships); ok {
-        if (opts & FetchOptionFetchRelated) == FetchOptionFetchRelated {
-          serr := rel.FetchRelated(e, opts, cxt)
-          if serr != nil {
-            err = serr; return
-          }
-        }
-      }
-      sval.Index(i).Set(v)
-      sp.Finish()
-    }(i, v, e)
-    i++
-    
-  }
-  waiter.Wait()
-  if err != nil {
-    return err // from sub-fetches
-  }
-  if err = rows.Err(); err != nil {
-    return err
   }
   spres.Finish()
+  
+  err = it.Close(); it = nil
+  if err != nil {
+    return err
+  }
   
   if isptr {
     rval.Elem().Set(sval)
@@ -513,13 +556,57 @@ func (d *persister) FetchEntities(p Persistent, r interface{}, opts FetchOptions
   return nil
 }
 
+// Fetch many persistent entities.
+func (d *orm) IterEntities(p Persister, t reflect.Type, opts FetchOptions, cxt godb.Context, src string, args ...interface{}) (*iter, error) {
+  var tr *trace.Trace
+  var sp *trace.Span
+  if debug.TRACE {
+    tr = trace.New("trace: db/iter: "+ text.CollapseSpaces(src)).Warn(time.Millisecond)
+    defer tr.Finish()
+  }
+  
+  start := time.Now()
+  defer func() { iterDurationMetric.Update(time.Since(start)) }()
+  cxt = d.Context(cxt)
+  
+  sp = tr.Start("Resolve entity type")
+  btype, _ := derefType(t)
+  if btype.Kind() != reflect.Struct {
+    return nil, fmt.Errorf("Entity must be a struct")
+  }
+  sp.Finish()
+  
+  sp = tr.Start("Get or create mapping")
+  var m PersistentMapping
+  if x, ok := p.(PersistentMapping); ok {
+    m = x
+  }else{
+    m = newMappingEntityForType(btype)
+  }
+  sp.Finish()
+  
+  sp = tr.Start("Parse PQL query")
+  q, err := pql.Parse(src, append(m.PrimaryKeys(), m.Columns()...))
+  if err != nil {
+    return nil, err
+  }
+  sp.Finish()
+  
+  sp = tr.Start("Execute query")
+  rows, err := cxt.Query(q.SQL, args...)
+  if err != nil {
+    return nil, err
+  }
+  sp.Finish()
+  
+  return newIter(rows, d, opts, cxt, m, p, q, tr), nil
+}
+
 // Delete a persistent entity.
-func (d *persister) DeleteEntity(p Persistent, v interface{}, opts StoreOptions, cxt gdb.Context) error {
+func (d *orm) DeleteEntity(p Persister, v interface{}, opts StoreOptions, cxt godb.Context) error {
   start := time.Now()
   defer func() { deleteDurationMetric.Update(time.Since(start)) }()
-  if cxt == nil {
-    cxt = d.DefaultContext()
-  }
+  cxt = d.Context(cxt)
   
   var m PersistentMapping
   if x, ok := p.(PersistentMapping); ok {
@@ -530,7 +617,7 @@ func (d *persister) DeleteEntity(p Persistent, v interface{}, opts StoreOptions,
   
   pkid := m.PersistentId(v)
   if IsEmpty(pkid) {
-    return gdb.ErrTransient
+    return godb.ErrTransient
   }
   
   pk := m.PrimaryKeys()
@@ -541,23 +628,18 @@ func (d *persister) DeleteEntity(p Persistent, v interface{}, opts StoreOptions,
     pk[0]: pkid,
   })
   
-  if rel, ok := p.(DeletesRelationships); ok {
-    if (opts & StoreOptionDeleteReferences) == StoreOptionDeleteReferences {
-      err := rel.DeleteReferences(v, opts, cxt)
-      if err != nil {
-        return err
-      }
-    }
-    if (opts & StoreOptionDeleteOrphans) == StoreOptionDeleteOrphans {
-      err := rel.DeleteRelated(v, opts, cxt)
-      if err != nil {
-        return err
-      }
-    }
+  err := d.DeleteReferences(p, v, opts, cxt)
+  if err != nil {
+    return err
+  }
+  
+  err = d.DeleteRelated(p, v, opts, cxt)
+  if err != nil {
+    return err
   }
   
   q := fmt.Sprintf("DELETE FROM %s WHERE %s", p.Table(), kv)
-  _, err := cxt.Exec(q, args...)
+  _, err = cxt.Exec(q, args...)
   if err != nil {
     return err
   }
@@ -566,7 +648,7 @@ func (d *persister) DeleteEntity(p Persistent, v interface{}, opts StoreOptions,
 }
 
 // A list of keys, values and ordered values
-func keyList(p string, e Values) (string, int, []interface{}) {
+func keyList(p string, e Columns) (string, int, []interface{}) {
   var o []interface{}
   var l string
   
@@ -586,7 +668,7 @@ func keyList(p string, e Values) (string, int, []interface{}) {
 }
 
 // A list of keys to values and ordered values
-func keyValueList(p string, e Values) (string, int, []interface{}) {
+func keyValueList(p string, e Columns) (string, int, []interface{}) {
   var o []interface{}
   var l string
   
@@ -622,4 +704,22 @@ func indirects(v reflect.Value, n int) reflect.Value {
     v = reflect.Indirect(v)
   }
   return v
+}
+
+// Dump a mapping
+func dumpMapping(v interface{}, names []string, dests []interface{}) {
+  if len(names) != len(dests) {
+    panic(fmt.Sprintf("persist: names and dests must be of equal lengths, but %d != %d", len(names), len(dests)))
+  }
+  fmt.Printf("<M> %T %v\n", v, v)
+  var dlen int
+  for _, e := range names {
+    if l := len(e); l > dlen {
+      dlen = l
+    }
+  }
+  dfmt := fmt.Sprintf("    %% 3d: %%%ds -> (%%T) %%+v\n", dlen)
+  for i, e := range dests {
+    fmt.Printf(dfmt, i, names[i], e, e)
+  }
 }

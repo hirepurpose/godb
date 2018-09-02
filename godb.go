@@ -7,7 +7,7 @@ import (
   "strings"
   "database/sql"
   
-  "gdb/sync"
+  "github.com/hirepurpose/godb/sync"
 )
 
 import (
@@ -71,7 +71,7 @@ func New(uri string, migrate bool, syncer sync.Service) (*Database, error) {
     if syncer == nil {
       panic("search: Cannot migrate without a synchronization service!")
     }
-    lock, err := syncer.Mutex(fmt.Sprintf("/gdb/%s/db/postgres", env.Environ()))
+    lock, err := syncer.Mutex(fmt.Sprintf("/godb/%s/db/postgres", env.Environ()))
     if err != nil {
       return nil, err
     }
@@ -92,7 +92,7 @@ func (d *Database) migrate() error {
     return err
   }
   
-  u, err := upgrade.New(upgrade.Config{Resources:env.Etc("schema/db"), Driver:p})
+  u, err := upgrade.New(upgrade.Config{Resources:env.Etc("db"), Driver:p})
   if err != nil {
     return err
   }
