@@ -52,7 +52,13 @@ func New(uri string, migrate bool, syncer sync.Service) (*Database, error) {
   }
   
   // note this here, since we don't want to log credentials
-  fmt.Printf("-----> Connecting to %v at: %v%v\n", strings.Title(u.Scheme), u.Host, u.Path)
+  fmt.Printf("-----> Connecting to %v at: %v%v", strings.Title(u.Scheme), u.Host, u.Path)
+  if info := u.User; info != nil {
+    fmt.Printf(" (%s)\n", info.Username())
+  }else{
+    fmt.Println()
+  }
+  
   // open our database connection
   db, err := sql.Open(u.Scheme, uri)
   if err != nil {
